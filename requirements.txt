@@ -1,1 +1,13 @@
-yfinance==0.2.66 pandas==2.3.2 matplotlib==3.10.6 numpy==2.3.3
+fastapi
+uvicorn[standard]
+pandas
+numpy
+yfinance
+ta
+scikit-learn
+tensorflow>=2.10
+sqlalchemy
+apscheduler
+python-multipart
+pydantic
+joblib
