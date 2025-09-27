@@ -256,13 +256,14 @@ def train_for_pair_timeframe(pair: str, timeframe: str,
 def predict_pair_timeframe(pair: str, timeframe: str, seq_len: int = SEQUENCE_LENGTH) -> Dict:
     """
     Load model+scaler, fetch most recent data, produce a prediction (probability) for next step up/down.
+    Adds confidence score and risk level.
     """
     model_file = model_path(pair, timeframe)
     scaler_file = scaler_path(pair, timeframe)
     if not os.path.exists(model_file) or not os.path.exists(scaler_file):
         raise FileNotFoundError("Model or scaler not found. Train first.")
 
-    # Load
+    # Load model and scaler
     model = load_model(model_file)
     scaler = joblib.load(scaler_file)
 
@@ -276,19 +277,43 @@ def predict_pair_timeframe(pair: str, timeframe: str, seq_len: int = SEQUENCE_LE
     X_raw = df_fe[features].values
     if len(X_raw) < seq_len:
         raise RuntimeError("Not enough data to predict - need more history.")
-    # Use last seq_len rows
+
+    # Compute volatility from recent returns
+    df_fe['returns'] = df_fe['Close'].pct_change()
+    volatility = df_fe['returns'].tail(50).std()  # last 50 points (tweak if needed)
+    volatility = float(volatility) if not np.isnan(volatility) else 0.0
+
+    # Prepare input sequence
     last_seq = X_raw[-seq_len:, :]
     last_seq_scaled = scaler.transform(last_seq)
     X_input = np.expand_dims(last_seq_scaled, axis=0)
-    prob = float(model.predict(X_input)[0][0])
-    label = int(prob > 0.5)
+
+    # Predict probability
+    prob_up = float(model.predict(X_input)[0][0])
+    label = int(prob_up > 0.5)
+
+    # Confidence score
+    confidence = float(max(prob_up, 1 - prob_up))
+
+    # Risk classification based on confidence and volatility
+    if confidence >= 0.8 and volatility < 0.005:
+        risk = "low"
+    elif confidence >= 0.65 and volatility < 0.01:
+        risk = "medium"
+    else:
+        risk = "high"
+
     return {
         "pair": pair,
         "timeframe": timeframe,
-        "prob_up": prob,
+        "prob_up": prob_up,
         "pred_label": label,
+        "confidence": confidence,
+        "volatility": volatility,
+        "risk": risk,
         "timestamp_utc": datetime.utcnow().isoformat()
     }
+
 
 # ---------------------------
 # Cache management
