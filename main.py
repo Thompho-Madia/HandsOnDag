@@ -10,10 +10,12 @@ import pandas as pd
 import yfinance as yf
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.optimizers import Adam
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as F
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -39,6 +41,9 @@ EPOCHS = 20
 BATCH_SIZE = 64
 LEARNING_RATE = 1e-3
 RANDOM_STATE = 42
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -164,26 +169,49 @@ def build_sequences(df: pd.DataFrame, seq_len: int) -> Tuple[np.ndarray, np.ndar
     return X, y, scaler
 
 # ---------------------------
-# Model
+# PyTorch Model
 # ---------------------------
-def build_lstm_model(input_shape: Tuple[int,int]) -> Sequential:
-    model = Sequential()
-    model.add(LSTM(64, input_shape=input_shape, return_sequences=True))
-    model.add(BatchNormalization())
-    model.add(Dropout(0.2))
-    model.add(LSTM(32))
-    model.add(BatchNormalization())
-    model.add(Dropout(0.2))
-    model.add(Dense(16, activation='relu'))
-    model.add(Dense(1, activation='sigmoid'))  # binary
-    model.compile(optimizer=Adam(learning_rate=LEARNING_RATE), loss='binary_crossentropy', metrics=['accuracy'])
-    return model
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim1=64, hidden_dim2=32, output_dim=16):
+        super(LSTMModel, self).__init__()
+        self.lstm1 = nn.LSTM(input_dim, hidden_dim1, batch_first=True)
+        self.bn1 = nn.BatchNorm1d(hidden_dim1)
+        self.dropout1 = nn.Dropout(0.2)
+        self.lstm2 = nn.LSTM(hidden_dim1, hidden_dim2, batch_first=True)
+        self.bn2 = nn.BatchNorm1d(hidden_dim2)
+        self.dropout2 = nn.Dropout(0.2)
+        self.fc1 = nn.Linear(hidden_dim2, output_dim)
+        self.fc2 = nn.Linear(output_dim, 1)
+        
+    def forward(self, x):
+        # LSTM layers
+        lstm1_out, _ = self.lstm1(x)
+        # Apply batch norm and dropout
+        lstm1_out = lstm1_out.permute(0, 2, 1)  # Change shape for batch norm
+        lstm1_out = self.bn1(lstm1_out)
+        lstm1_out = lstm1_out.permute(0, 2, 1)  # Change back
+        lstm1_out = self.dropout1(lstm1_out)
+        
+        lstm2_out, _ = self.lstm2(lstm1_out)
+        # Get last time step
+        lstm2_out = lstm2_out[:, -1, :]
+        lstm2_out = self.bn2(lstm2_out)
+        lstm2_out = self.dropout2(lstm2_out)
+        
+        # Fully connected layers
+        fc1_out = F.relu(self.fc1(lstm2_out))
+        output = torch.sigmoid(self.fc2(fc1_out))
+        return output
+
+def build_lstm_model(input_dim: int) -> LSTMModel:
+    model = LSTMModel(input_dim=input_dim)
+    return model.to(device)
 
 # ---------------------------
 # Save / Load model + scaler
 # ---------------------------
 def model_path(pair: str, timeframe: str) -> str:
-    return os.path.join(MODEL_DIR, f"{pair}_{timeframe}.h5")
+    return os.path.join(MODEL_DIR, f"{pair}_{timeframe}.pth")
 
 def scaler_path(pair: str, timeframe: str) -> str:
     return os.path.join(MODEL_DIR, f"{pair}_{timeframe}_scaler.pkl")
@@ -213,40 +241,94 @@ def train_for_pair_timeframe(pair: str, timeframe: str,
 
     X, y, scaler = build_sequences(df, seq_len)
 
+    # Convert to PyTorch tensors
+    X_tensor = torch.FloatTensor(X).to(device)
+    y_tensor = torch.FloatTensor(y).to(device).unsqueeze(1)
+    
     # Train/test split
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.15, random_state=RANDOM_STATE, shuffle=False)
+    split_idx = int(0.85 * len(X_tensor))
+    X_train, X_val = X_tensor[:split_idx], X_tensor[split_idx:]
+    y_train, y_val = y_tensor[:split_idx], y_tensor[split_idx:]
 
-    input_shape = (X_train.shape[1], X_train.shape[2])
+    # Create DataLoaders
+    train_dataset = TensorDataset(X_train, y_train)
+    val_dataset = TensorDataset(X_val, y_val)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    input_dim = X_train.shape[2]
     model_file = model_path(pair, timeframe)
-    best_model_file = model_file + ".best.h5"
+    best_model_file = model_file.replace('.pth', '.best.pth')
 
-    model = build_lstm_model(input_shape)
-    callbacks = [
-        EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-        ModelCheckpoint(best_model_file, monitor='val_loss', save_best_only=True, save_weights_only=False)
-    ]
+    model = build_lstm_model(input_dim)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=callbacks,
-        verbose=1
-    )
+    # Training variables
+    best_val_loss = float('inf')
+    train_losses = []
+    val_losses = []
+    val_accuracies = []
 
-    # Save final model and scaler
-    model.save(model_file)
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        train_loss = 0.0
+        for batch_X, batch_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch_X, batch_y in val_loader:
+                outputs = model(batch_X)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
+                predicted = (outputs > 0.5).float()
+                total += batch_y.size(0)
+                correct += (predicted == batch_y).sum().item()
+        
+        train_losses.append(train_loss / len(train_loader))
+        val_losses.append(val_loss / len(val_loader))
+        val_accuracy = correct / total
+        val_accuracies.append(val_accuracy)
+        
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), best_model_file)
+        
+        # Early stopping
+        if epoch > 5 and val_losses[-1] > val_losses[-2]:
+            patience_counter += 1
+            if patience_counter >= 5:
+                break
+        else:
+            patience_counter = 0
+
+    # Load best model and save
+    model.load_state_dict(torch.load(best_model_file))
+    torch.save(model.state_dict(), model_file)
     joblib.dump(scaler, scaler_path(pair, timeframe))
 
+    # Clean up best model file
+    if os.path.exists(best_model_file):
+        os.remove(best_model_file)
+
     # return summary
-    final_val_acc = float(history.history.get('val_accuracy', [None])[-1])
-    final_val_loss = float(history.history.get('val_loss', [None])[-1])
     return {
         "pair": pair,
         "timeframe": timeframe,
-        "val_accuracy": final_val_acc,
-        "val_loss": final_val_loss,
+        "val_accuracy": val_accuracies[-1] if val_accuracies else 0.0,
+        "val_loss": val_losses[-1] if val_losses else float('inf'),
         "trained_at": datetime.utcnow().isoformat()
     }
 
@@ -264,9 +346,6 @@ def predict_pair_timeframe(pair: str, timeframe: str, seq_len: int = SEQUENCE_LE
         raise FileNotFoundError("Model or scaler not found. Train first.")
 
     # Load model and scaler
-    model = load_model(model_file)
-    scaler = joblib.load(scaler_file)
-
     tf_cfg = TIMEFRAMES[timeframe]
     df = fetch_ohlc(pair, interval=tf_cfg['interval'], lookback_days=tf_cfg['lookback_days'])
     if 'resample' in tf_cfg:
@@ -278,6 +357,9 @@ def predict_pair_timeframe(pair: str, timeframe: str, seq_len: int = SEQUENCE_LE
     if len(X_raw) < seq_len:
         raise RuntimeError("Not enough data to predict - need more history.")
 
+    # Load scaler and prepare input
+    scaler = joblib.load(scaler_file)
+    
     # Compute volatility from recent returns
     df_fe['returns'] = df_fe['Close'].pct_change()
     volatility = df_fe['returns'].tail(50).std()  # last 50 points (tweak if needed)
@@ -286,10 +368,18 @@ def predict_pair_timeframe(pair: str, timeframe: str, seq_len: int = SEQUENCE_LE
     # Prepare input sequence
     last_seq = X_raw[-seq_len:, :]
     last_seq_scaled = scaler.transform(last_seq)
-    X_input = np.expand_dims(last_seq_scaled, axis=0)
+    X_input = torch.FloatTensor(last_seq_scaled).unsqueeze(0).to(device)
+
+    # Load and initialize model
+    input_dim = X_input.shape[2]
+    model = build_lstm_model(input_dim)
+    model.load_state_dict(torch.load(model_file, map_location=device))
+    model.eval()
 
     # Predict probability
-    prob_up = float(model.predict(X_input)[0][0])
+    with torch.no_grad():
+        prob_up = float(model(X_input).cpu().numpy()[0][0])
+    
     label = int(prob_up > 0.5)
 
     # Confidence score
@@ -313,7 +403,6 @@ def predict_pair_timeframe(pair: str, timeframe: str, seq_len: int = SEQUENCE_LE
         "risk": risk,
         "timestamp_utc": datetime.utcnow().isoformat()
     }
-
 
 # ---------------------------
 # Cache management
@@ -425,7 +514,6 @@ def retrain_popular():
         return {"status": "ok", "message": "Popular pairs retrained"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # If running directly
 if __name__ == "__main__":
